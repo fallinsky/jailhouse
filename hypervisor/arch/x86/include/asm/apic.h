@@ -99,6 +99,15 @@ union x86_msi_vector {
 		    reserved:21;
 	} native;
 	struct {
+		u64 unused:2,
+		    index15:1,
+		    svh:1,
+		    redir_format:1,
+		    index:15,
+		    address:44;
+		u32 zero;
+	} redir;
+	struct {
 		u64 address;
 		u32 data;
 	} raw;
