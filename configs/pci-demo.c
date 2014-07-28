@@ -79,6 +79,7 @@ struct {
 			.bdf = 0x00d8,
 			.caps_start = 0,
 			.num_caps = 1,
+			.num_msi_vectors = 1,
 		},
 	},
 

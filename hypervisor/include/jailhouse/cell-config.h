@@ -65,6 +65,8 @@ struct jailhouse_pci_device {
 	__u16 bdf;
 	__u16 caps_start;
 	__u16 num_caps;
+	__u16 num_msi_vectors;
+	__u16 padding;
 } __attribute__((packed));
 
 #define JAILHOUSE_PCICAPS_WRITE		0x0001

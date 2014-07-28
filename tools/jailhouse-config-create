@@ -65,11 +65,12 @@ inputs = {'files': set(), 'files_opt': set(), 'dirs': set()}
 
 
 class PCICapability:
-    def __init__(self, id, start, len, flags):
+    def __init__(self, id, start, len, flags, content):
         self.id = id
         self.start = start
         self.len = len
         self.flags = flags
+        self.content = content
         self.comments = []
 
     def __eq__(self, other):
@@ -117,7 +118,9 @@ class PCICapability:
                 # unknown/unhandled cap, mark its existence
                 len = 2
                 flags = PCICapability.RD
-            caps.append(PCICapability(id, cap, len, flags))
+            f.seek(cap + 2)
+            content = f.read(len - 2)
+            caps.append(PCICapability(id, cap, len, flags, content))
         return caps
 
 
@@ -131,6 +134,15 @@ class PCIDevice:
         self.caps = caps
         self.caps_start = 0
         self.num_caps = len(caps)
+        self.num_msi_vectors = 0
+        for c in caps:
+            if c.id in (0x05, 0x11):
+                msg_ctrl = struct.unpack('<H', c.content[:2])[0]
+                if c.id == 0x05:  # MSI
+                    vectors = 1 << ((msg_ctrl >> 1) & 0x7)
+                else:  # MSI-X
+                    vectors = (msg_ctrl & 0x7ff) + 1
+                self.num_msi_vectors = max(self.num_msi_vectors, vectors)
 
     def __str__(self):
         return 'PCIDevice: %02x:%02x.%x' % (self.bus, self.dev, self.fn)

@@ -130,6 +130,7 @@ struct {
 			.bdf = 0x0018,
 			.caps_start = 0,
 			.num_caps = 1,
+			.num_msi_vectors = 2,
 		},
 		{ /* ISA bridge */
 			.type = JAILHOUSE_PCI_TYPE_DEVICE,
@@ -142,6 +143,7 @@ struct {
 			.bdf = 0x00fa,
 			.caps_start = 2,
 			.num_caps = 2,
+			.num_msi_vectors = 1,
 		},
 		{ /* SMBus */
 			.type = JAILHOUSE_PCI_TYPE_DEVICE,
