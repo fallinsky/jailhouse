@@ -1,7 +1,7 @@
 /*
  * Jailhouse, a Linux-based partitioning hypervisor
  *
- * Copyright (c) Siemens AG, 2013
+ * Copyright (c) Siemens AG, 2013, 2014
  *
  * Authors:
  *  Jan Kiszka <jan.kiszka@siemens.com>
@@ -17,12 +17,15 @@
 #include <jailhouse/printk.h>
 #include <jailhouse/string.h>
 #include <asm/bitops.h>
+#include <asm/ioapic.h>
 #include <asm/spinlock.h>
 #include <asm/vtd.h>
 
 /* TODO: Support multiple segments */
 static struct vtd_entry __attribute__((aligned(PAGE_SIZE)))
 	root_entry_table[256];
+static union vtd_irte *int_remap_table;
+static unsigned int int_remap_table_size_log2;
 static struct paging vtd_paging[VTD_MAX_PAGE_DIR_LEVELS];
 static void *dmar_reg_base;
 static void *unit_inv_queue;
@@ -208,6 +211,10 @@ static void vtd_init_unit(void *reg_base, void *inv_queue)
 			VTD_INV_IOTLB_DW | VTD_INV_IOTLB_DR,
 		.hi_word = 0,
 	};
+	struct vtd_entry inv_int = {
+		.lo_word = VTD_REQ_INV_INT | VTD_INV_INT_GLOBAL,
+		.hi_word = 0,
+	};
 	void *fault_reg_base;
 	unsigned int nfr, n;
 
@@ -228,6 +235,12 @@ static void vtd_init_unit(void *reg_base, void *inv_queue)
 		     page_map_hvirt2phys(root_entry_table));
 	vtd_update_gcmd_reg(reg_base, VTD_GCMD_SRTP, 1);
 
+	/* Set interrupt remapping table pointer */
+	mmio_write64(reg_base + VTD_IRTA_REG,
+		     page_map_hvirt2phys(int_remap_table) |
+		     (int_remap_table_size_log2 - 1));
+	vtd_update_gcmd_reg(reg_base, VTD_GCMD_SIRTP, 1);
+
 	/* Setup and activate invalidation queue */
 	mmio_write64(reg_base + VTD_IQT_REG, 0);
 	mmio_write64(reg_base + VTD_IQA_REG, page_map_hvirt2phys(inv_queue));
@@ -235,15 +248,29 @@ static void vtd_init_unit(void *reg_base, void *inv_queue)
 
 	vtd_flush_unit_cache(reg_base, inv_queue, inv_context);
 	vtd_flush_unit_cache(reg_base, inv_queue, inv_iotlb);
+	vtd_flush_unit_cache(reg_base, inv_queue, inv_int);
 }
 
 int vtd_init(void)
 {
-	unsigned long caps, sllps_caps = ~0UL;
+	unsigned long size, caps, ecaps, sllps_caps = ~0UL;
 	unsigned int pt_levels, num_did, n;
 	void *reg_base, *inv_queue;
 	u64 base_addr;
 	int err;
+
+	/* n = roundup(log2(system_config->interrupt_limit)) */
+	for (n = 0; (1UL << n) < (system_config->interrupt_limit); n++)
+		; /* empty loop */
+	if (n >= 16)
+		return -EINVAL;
+
+	size = PAGE_ALIGN(sizeof(union vtd_irte) << n);
+	int_remap_table = page_alloc(&mem_pool, size / PAGE_SIZE);
+	if (!int_remap_table)
+		return -ENOMEM;
+
+	int_remap_table_size_log2 = n;
 
 	for (n = 0; n < JAILHOUSE_MAX_DMAR_UNITS; n++) {
 		base_addr = system_config->platform_info.x86.dmar_unit_base[n];
@@ -293,7 +320,8 @@ int vtd_init(void)
 		if (caps & VTD_CAP_CM)
 			return -EIO;
 
-		if (!(mmio_read64(reg_base + VTD_ECAP_REG) & VTD_ECAP_QI))
+		ecaps = mmio_read64(reg_base + VTD_ECAP_REG);
+		if (!(ecaps & VTD_ECAP_QI) || !(ecaps & VTD_ECAP_IR))
 			return -EIO;
 
 		if (mmio_read32(reg_base + VTD_GSTS_REG) & VTD_GSTS_USED_CTRLS)
@@ -324,15 +352,112 @@ int vtd_init(void)
 	return vtd_cell_init(&root_cell);
 }
 
+static void vtd_update_irte(unsigned int index, union vtd_irte content)
+{
+	struct vtd_entry inv_int = {
+		.lo_word = VTD_REQ_INV_INT | VTD_INV_INT_INDEX |
+			((u64)index << VTD_INV_INT_IIDX_SHIFT),
+		.hi_word = 0,
+	};
+	union vtd_irte *irte = &int_remap_table[index];
+	void *inv_queue = unit_inv_queue;
+	void *reg_base = dmar_reg_base;
+	unsigned int n;
+
+	if (content.field.p) {
+		/*
+		 * Write upper half first to preserve non-presence.
+		 * If the entry was present before, we are only modifying the
+		 * lower half's content (destination etc.), so writing the
+		 * upper half becomes a nop and is safely done first.
+		 */
+		irte->raw[1] = content.raw[1];
+		memory_barrier();
+		irte->raw[0] = content.raw[0];
+	} else {
+		/*
+		 * Write only lower half - we are clearing presence and
+		 * assignment.
+		 */
+		irte->raw[0] = content.raw[0];
+	}
+	flush_cache(irte, sizeof(*irte));
+
+	for (n = 0; n < dmar_units; n++) {
+		vtd_flush_unit_cache(reg_base, inv_queue, inv_int);
+		reg_base += PAGE_SIZE;
+		inv_queue += PAGE_SIZE;
+	}
+}
+
+static int vtd_find_int_remap_region(u16 device_id)
+{
+	int n;
+
+	/* interrupt_limit is < 2^16, see vtd_init */
+	for (n = 0; n < system_config->interrupt_limit; n++)
+		if (int_remap_table[n].field.assigned &&
+		    int_remap_table[n].field.sid == device_id)
+			return n;
+
+	return -ENOENT;
+}
+
+static int vtd_reserve_int_remap_region(u16 device_id, unsigned int length)
+{
+	int n, start = -E2BIG;
+
+	if (length == 0 || vtd_find_int_remap_region(device_id) >= 0)
+		return 0;
+
+	for (n = 0; n < system_config->interrupt_limit; n++) {
+		if (int_remap_table[n].field.assigned) {
+			start = -E2BIG;
+			continue;
+		}
+		if (start < 0)
+			start = n;
+		if (n + 1 == start + length) {
+			printk("Reserving %u interrupt(s) for device %04x "
+			       "at index %d\n", length, device_id, start);
+			for (n = start; n < start + length; n++) {
+				int_remap_table[n].field.assigned = 1;
+				int_remap_table[n].field.sid = device_id;
+			}
+			return start;
+		}
+	}
+	return -E2BIG;
+}
+
+static void vtd_free_int_remap_region(u16 device_id, unsigned int length)
+{
+	union vtd_irte free_irte = { .field.p = 0, .field.assigned = 0 };
+	int pos = vtd_find_int_remap_region(device_id);
+
+	if (pos >= 0) {
+		printk("Freeing %u interrupt(s) for device %04x at index %d\n",
+		       length, device_id, pos);
+		while (length-- > 0)
+			vtd_update_irte(pos, free_irte);
+	}
+}
+
 int vtd_add_pci_device(struct cell *cell, struct pci_device *device)
 {
 	u16 bdf = device->info->bdf;
 	u64 *root_entry_lo = &root_entry_table[PCI_BUS(bdf)].lo_word;
 	struct vtd_entry *context_entry_table, *context_entry;
+	int result;
 
 	// HACK for QEMU
 	if (dmar_units == 0)
 		return 0;
+
+	result = vtd_reserve_int_remap_region(bdf,
+					      device->info->num_msi_vectors);
+	if (result < 0)
+		return result;
 
 	if (*root_entry_lo & VTD_ROOT_PRESENT) {
 		context_entry_table =
@@ -340,7 +465,7 @@ int vtd_add_pci_device(struct cell *cell, struct pci_device *device)
 	} else {
 		context_entry_table = page_alloc(&mem_pool, 1);
 		if (!context_entry_table)
-			return -ENOMEM;
+			goto error_nomem;
 		*root_entry_lo = VTD_ROOT_PRESENT |
 			page_map_hvirt2phys(context_entry_table);
 		flush_cache(root_entry_lo, sizeof(u64));
@@ -355,6 +480,10 @@ int vtd_add_pci_device(struct cell *cell, struct pci_device *device)
 	flush_cache(context_entry, sizeof(*context_entry));
 
 	return 0;
+
+error_nomem:
+	vtd_free_int_remap_region(bdf, device->info->num_msi_vectors);
+	return -ENOMEM;
 }
 
 void vtd_remove_pci_device(struct pci_device *device)
@@ -375,6 +504,8 @@ void vtd_remove_pci_device(struct pci_device *device)
 	context_entry->lo_word &= ~VTD_CTX_PRESENT;
 	flush_cache(&context_entry->lo_word, sizeof(u64));
 
+	vtd_free_int_remap_region(bdf, device->info->num_msi_vectors);
+
 	for (n = 0; n < 256; n++)
 		if (context_entry_table[n].lo_word & VTD_CTX_PRESENT)
 			return;
@@ -386,6 +517,11 @@ void vtd_remove_pci_device(struct pci_device *device)
 
 int vtd_cell_init(struct cell *cell)
 {
+	const struct jailhouse_irqchip *irqchip =
+		jailhouse_cell_irqchips(cell->config);
+	unsigned int n;
+	int result;
+
 	// HACK for QEMU
 	if (dmar_units == 0)
 		return 0;
@@ -397,6 +533,16 @@ int vtd_cell_init(struct cell *cell)
 	cell->vtd.pg_structs.root_table = page_alloc(&mem_pool, 1);
 	if (!cell->vtd.pg_structs.root_table)
 		return -ENOMEM;
+
+	/* reserve regions for IRQ chips (if not done already) */
+	for (n = 0; n < cell->config->num_irqchips; n++, irqchip++) {
+		result = vtd_reserve_int_remap_region(irqchip->id,
+						      IOAPIC_NUM_PINS);
+		if (result < 0) {
+			vtd_cell_exit(cell);
+			return result;
+		}
+	}
 
 	vtd_init_fault_nmi();
 
@@ -442,7 +588,56 @@ int vtd_unmap_memory_region(struct cell *cell,
 int vtd_map_interrupt(struct cell *cell, u16 device_id, unsigned int vector,
 		      struct apic_irq_message irq_msg)
 {
-	return -ENOSYS;
+	union vtd_irte irte;
+	int base_index;
+
+	// HACK for QEMU
+	if (dmar_units == 0)
+		return -ENOSYS;
+
+	base_index = vtd_find_int_remap_region(device_id);
+	if (base_index < 0)
+		return base_index;
+
+	irte = int_remap_table[base_index + vector];
+	if (vector >= system_config->interrupt_limit ||
+	    base_index >= system_config->interrupt_limit - vector ||
+	    !irte.field.assigned || irte.field.sid != device_id)
+		return -ERANGE;
+
+	/* validate delivery mode and destination(s) */
+	// TODO: Support x2APIC cluster mode
+	if ((irq_msg.delivery_mode != APIC_MSG_DLVR_FIXED &&
+	     irq_msg.delivery_mode != APIC_MSG_DLVR_LOWPRI) ||
+	    (using_x2apic && irq_msg.dest_logical))
+		return -EPERM;
+	if (irq_msg.dest_logical)
+		/*
+		 * Linux may have programmed inactive vectors with too broad
+		 * destination masks. Silently adjust them when programming the
+		 * IRTE instead of failing the whole cell here.
+		 */
+		irq_msg.destination &= cell->cpu_set->bitmap[0];
+	else if (irq_msg.destination > APIC_MAX_PHYS_ID ||
+		   !test_bit(apic_to_cpu_id[irq_msg.destination],
+			     cell->cpu_set->bitmap))
+		return -EPERM;
+
+	irte.field.dest_logical = irq_msg.dest_logical;
+	irte.field.redir_hint = irq_msg.redir_hint;
+	irte.field.level_triggered = irq_msg.level_triggered;
+	irte.field.delivery_mode = irq_msg.delivery_mode;
+	irte.field.vector = irq_msg.vector;
+	irte.field.destination = irq_msg.destination;
+	if (!using_x2apic)
+		/* xAPIC in flat mode: APIC ID in 47:40 (of 63:32) */
+		irte.field.destination <<= 8;
+	irte.field.sq = VTD_IRTE_SQ_VERIFY_FULL_SID;
+	irte.field.svt = VTD_IRTE_SVT_VERIFY_SID_SQ;
+	irte.field.p = 1;
+	vtd_update_irte(base_index + vector, irte);
+
+	return base_index + vector;
 }
 
 void vtd_cell_exit(struct cell *cell)
@@ -452,6 +647,11 @@ void vtd_cell_exit(struct cell *cell)
 		return;
 
 	page_free(&mem_pool, cell->vtd.pg_structs.root_table, 1);
+
+	/*
+	 * Note that reservation regions of IOAPICs won't be released because
+	 * they might be shared with other cells
+	 */
 }
 
 void vtd_config_commit(struct cell *cell_added_removed)
@@ -470,8 +670,10 @@ void vtd_config_commit(struct cell *cell_added_removed)
 	if (mmio_read32(reg_base + VTD_GSTS_REG) & VTD_GSTS_TES)
 		return;
 
-	for (n = 0; n < dmar_units; n++, reg_base += PAGE_SIZE)
+	for (n = 0; n < dmar_units; n++, reg_base += PAGE_SIZE) {
 		vtd_update_gcmd_reg(reg_base, VTD_GCMD_TE, 1);
+		vtd_update_gcmd_reg(reg_base, VTD_GCMD_IRE, 1);
+	}
 }
 
 void vtd_shutdown(void)
@@ -480,6 +682,7 @@ void vtd_shutdown(void)
 	unsigned int n;
 
 	for (n = 0; n < dmar_units; n++, reg_base += PAGE_SIZE) {
+		vtd_update_gcmd_reg(reg_base, VTD_GCMD_IRE, 0);
 		vtd_update_gcmd_reg(reg_base, VTD_GCMD_TE, 0);
 		vtd_update_gcmd_reg(reg_base, VTD_GCMD_QIE, 0);
 	}
