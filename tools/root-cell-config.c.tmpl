@@ -42,6 +42,8 @@ struct {
 				% endfor
 			},
 		},
+		.device_limit = 128,
+		.interrupt_limit = 256,
 		.root_cell = {
 			.name = "RootCell",
 			.cpu_set_size = sizeof(config.cpus),
