@@ -2,11 +2,8 @@ Things to be addressed, at some point. Unsorted, unprioritized, incomplete.
 
 o x86 support
  - interrupt remapping support
-  - IOAPIC virtualization [WIP]
-  - MSI virtualization (for PCI and HPET)
-  - VT-d setup
- - PCI resource access control
-  - config space access moderation [WIP]
+  - VT-d interrupt remapping emulation (for x2APIC support)
+  - MSI virtualization for HPET?
  - AMD64 (SVM) [WIP]
  - power management
   - block
@@ -34,6 +31,7 @@ o setup validation
   - pure software solution (without security requirements)
   - Intel TXT support?
   - secure boot?
+ - check for execution inside hypervisor, allow only when enabled in config
 o inter-cell communication channel
  - shared memory + doorbell IRQs
  - queues + doorbell?
@@ -45,7 +43,8 @@ o testing
 o inmates
  - reusable runtime environment for cell inmates
   - skeleton in separate directory
-  - hw access libraries (x86: APIC, TSC calibration, PCI, IOAPIC, ...)
+  - hw access libraries
+   - x86: add TSC calibration
   - inter-cell communication library
  - port free small-footprint RTOS to Jailhouse bare-metal environment
    [WIP: RTEMS]
